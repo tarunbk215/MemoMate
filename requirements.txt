@@ -1,0 +1,9 @@
+streamlit
+PyPDF2
+transformers
+sentence-transformers
+pytesseract
+pdf2image
+huggingface_hub
+numpy
+python-dotenv
