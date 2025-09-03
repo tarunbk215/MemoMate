@@ -1,134 +1,195 @@
-import streamlit as st
-import PyPDF2
-from transformers import pipeline
-from dotenv import load_dotenv
 import os
-import pytesseract
-from pdf2image import convert_from_bytes
-from io import BytesIO
+import streamlit as st
+import fitz  # PyMuPDF
+import time
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
 from huggingface_hub import login
-from sentence_transformers import SentenceTransformer
-import numpy as np
+from dotenv import load_dotenv
 
-# Load Hugging Face API key
-load_dotenv()
-HF_API_KEY = os.getenv("HF_API_KEY")
+# ==================== LOAD ENV ====================
+load_dotenv()  # ✅ loads .env file automatically
 
-if HF_API_KEY:
-    try:
-        login(token=HF_API_KEY)
-        st.success("🔑 Hugging Face login successful.")
-    except Exception as e:
-        st.warning(f"Hugging Face login failed: {e}")
-else:
-    st.info("No HF_API_KEY found. Using public model without authentication.")
-
-# Initialize models
-qa_pipeline = pipeline(
-    "question-answering",
-    model="deepset/roberta-base-squad2",
-    tokenizer="deepset/roberta-base-squad2",
-    device=-1,
-    framework="pt"
+# ==================== PAGE CONFIG (must be first Streamlit command) ====================
+st.set_page_config(
+    page_title="StudyMate - PDF Summarizer & Q/A",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=-1)
-embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+# ==================== HUGGING FACE LOGIN ====================
+hf_token = os.getenv("HF_API_KEY")
+if hf_token:
+    login(hf_token)  # ✅ correct usage
+else:
+    st.warning("⚠️ Hugging Face API key not found! Please set HF_API_KEY in your .env file.")
 
-st.set_page_config(page_title="MemoMate", page_icon="📚", layout="centered")
-st.title("📚 MemoMate (Enhanced Version)")
-st.caption("AI-powered PDF Q&A, Summarization & Concept Explainer")
-
-# Extract text from PDF
-def extract_text_from_pdf(pdf_bytes):
-    reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
-    text = ""
-    for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
-    # OCR fallback
-    if not text.strip():
-        images = convert_from_bytes(pdf_bytes)
-        for image in images:
-            text += pytesseract.image_to_string(image) + "\n"
-    return " ".join(text.split())
-
-# Split text into chunks
-def split_text(text, chunk_size=400, overlap=50):
-    words = text.split()
-    for i in range(0, len(words), chunk_size - overlap):
-        yield " ".join(words[i:i + chunk_size])
-
-# Semantic search
-def find_relevant_chunks(question, chunks, top_n=3):
-    chunk_embeddings = embedding_model.encode(chunks)
-    question_embedding = embedding_model.encode([question])[0]
-    similarities = np.dot(chunk_embeddings, question_embedding) / (
-        np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(question_embedding)
+# ==================== LOAD MODELS ====================
+@st.cache_resource
+def load_models():
+    summarizer = pipeline(
+        "summarization",
+        model="facebook/bart-large-cnn",
+        tokenizer="facebook/bart-large-cnn",
+        device=-1  # CPU
     )
-    top_indices = similarities.argsort()[-top_n:][::-1]
-    return [chunks[i] for i in top_indices]
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    return summarizer, embedder
 
-# Upload PDF
-uploaded_pdf = st.file_uploader("Upload PDF file", type=["pdf"])
+summarizer, embedder = load_models()
 
-if uploaded_pdf:
-    pdf_bytes = uploaded_pdf.read()
-    pdf_text = extract_text_from_pdf(pdf_bytes)
+# ==================== PDF EXTRACTION ====================
+def extract_text_from_pdf(pdf_file):
+    text = ""
+    pdf = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    for page in pdf:
+        text += page.get_text()
+    return text.strip()
 
-    if not pdf_text.strip():
-        st.error("⚠️ No extractable text found in this PDF.")
+# ==================== TEXT SPLITTING ====================
+def split_text_into_chunks(text, max_words=300):  # ✅ smaller chunks
+    words = text.split()
+    for i in range(0, len(words), max_words):
+        yield " ".join(words[i:i+max_words])
+
+# ==================== SUMMARIZATION ====================
+def summarize_large_text(text):
+    if len(text.split()) < 50:
+        return "Document too short to summarize."
+    summaries = []
+    for chunk in split_text_into_chunks(text):
+        try:
+            summary_chunk = summarizer(
+                chunk,
+                max_length=150,
+                min_length=50,
+                do_sample=False
+            )[0]['summary_text']
+            summaries.append(summary_chunk)
+        except Exception as e:
+            summaries.append(f"[Error summarizing chunk: {e}]")
+    return " ".join(summaries)
+
+# ==================== Q/A ====================
+def answer_question(question, text):
+    sentences = text.split(". ")
+    question_embedding = embedder.encode(question, convert_to_tensor=True)
+    sentence_embeddings = embedder.encode(sentences, convert_to_tensor=True)
+    hits = util.semantic_search(question_embedding, sentence_embeddings, top_k=5)[0]
+    answers = [sentences[hit['corpus_id']] for hit in hits if hit['score'] > 0.3]
+    return " ".join(answers) if answers else "No relevant answer found."
+
+# ==================== CUSTOM CSS ====================
+st.markdown("""
+    <style>
+        .home-background {
+            background: linear-gradient(135deg, #1e1e2f, #2c2c54, #4b3869);
+            padding: 40px;
+            border-radius: 12px;
+            color: white;
+        }
+        .title {
+            font-size: 50px;
+            font-weight: bold;
+            text-align: center;
+            background: -webkit-linear-gradient(#f8d66d, #ffcc00);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle {
+            text-align: center;
+            font-size: 20px;
+            opacity: 0.9;
+            font-style: italic;
+        }
+        .footer {
+            text-align: center;
+            padding: 15px;
+            margin-top: 30px;
+            opacity: 0.7;
+            font-size: 14px;
+            color: #bbb;
+        }
+        .stButton>button {
+            background: linear-gradient(90deg, #b993d6, #8ca6db);
+            color: white;
+            border-radius: 8px;
+            padding: 10px 18px;
+            font-size: 16px;
+            border: none;
+        }
+        .stButton>button:hover {
+            background: linear-gradient(90deg, #8ca6db, #b993d6);
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==================== SIDEBAR ====================
+menu = st.sidebar.radio(
+    "📑 Menu",
+    ["🏠 Home", "📂 Upload & Preview", "📝 Summarize", "💬 Ask a Question", "ℹ️ About"]
+)
+
+st.sidebar.markdown("---")
+st.sidebar.info("💡 **Tip:** Upload a clear, text-based PDF for the best results.")
+st.sidebar.markdown("**Version:** 2.0 🚀")
+
+# ==================== HOME PAGE ====================
+if menu == "🏠 Home":
+    with st.container():
+        st.markdown("<div class='home-background'>", unsafe_allow_html=True)
+        st.markdown("<div class='title'>StudyMate!</div>", unsafe_allow_html=True)
+        st.markdown("<div class='subtitle'>Your AI-powered PDF Summarizer & Q/A Assistant</div>", unsafe_allow_html=True)
+        st.markdown("<hr style='border: 1px solid #ffcc00;'>", unsafe_allow_html=True)
+        st.write("Welcome to **StudyMate**, where you can upload large PDFs, get AI-generated summaries, and ask intelligent questions based on the content.")
+        st.write("Use the **menu** on the left to explore features.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# ==================== UPLOAD PAGE ====================
+elif menu == "📂 Upload & Preview":
+    uploaded_file = st.file_uploader("📂 Upload your PDF", type="pdf")
+    if uploaded_file:
+        pdf_text = extract_text_from_pdf(uploaded_file)
+        st.markdown("### 📄 PDF Text Preview")
+        st.info(pdf_text[:1200] + "..." if len(pdf_text) > 1200 else pdf_text)
+        st.session_state["pdf_text"] = pdf_text
+
+# ==================== SUMMARIZE PAGE ====================
+elif menu == "📝 Summarize":
+    if "pdf_text" in st.session_state:
+        if st.button("📝 Generate Summary"):
+            with st.spinner("Summarizing large document... Please wait..."):
+                summary = summarize_large_text(st.session_state["pdf_text"])
+            st.markdown("### 📝 Summary")
+            st.success(summary)
+            st.session_state["summary"] = summary
     else:
-        st.success("✅ PDF uploaded and processed!")
+        st.warning("⚠ Please upload a PDF first from the 'Upload & Preview' section.")
 
-        if st.checkbox("Show extracted PDF text"):
-            st.text_area("PDF Text Preview", pdf_text, height=300)
+# ==================== ASK QUESTION PAGE ====================
+elif menu == "💬 Ask a Question":
+    if "pdf_text" in st.session_state:
+        user_question = st.text_input("💬 Type your question here:")
+        if st.button("🔍 Get Answer"):
+            with st.spinner("Searching for the best answer..."):
+                answer = answer_question(user_question, st.session_state["pdf_text"])
+            st.markdown("### 📢 Answer")
+            st.success(answer)
+    else:
+        st.warning("⚠ Please upload a PDF first from the 'Upload & Preview' section.")
 
-        # PDF Summarization
-        if st.button("Summarize PDF"):
-            with st.spinner("Generating summary..."):
-                summary = summarizer(pdf_text, max_length=300, min_length=80, do_sample=False)[0]['summary_text']
-                st.markdown(f"**PDF Summary:** {summary}")
-                st.download_button(
-                    label="Download Summary",
-                    data=summary,
-                    file_name="pdf_summary.txt",
-                    mime="text/plain"
-                )
+# ==================== ABOUT PAGE ====================
+elif menu == "ℹ️ About":
+    st.markdown("## ℹ️ About StudyMate")
+    st.write("""
+    StudyMate is an AI-powered tool that:
+    - 📂 Extracts text from PDFs
+    - 📝 Summarizes large documents
+    - 💬 Answers questions based on PDF content
+    
+    Built using **Streamlit**, **Hugging Face Transformers**, and **Sentence Transformers**.
+    """)
 
-        # Q&A Section
-        question = st.text_input("Ask a question about the PDF or a concept:")
-
-        if st.button("Get Answer"):
-            if question.strip() == "":
-                st.warning("Please enter a question.")
-            else:
-                with st.spinner("Finding the answer..."):
-                    chunks = list(split_text(pdf_text, chunk_size=400, overlap=50))
-                    relevant_chunks = find_relevant_chunks(question, chunks, top_n=3)
-
-                    final_answers = []
-                    for chunk in relevant_chunks:
-                        answer = qa_pipeline(question=question, context=chunk)
-                        if answer.get("score", 0) > 0.0:
-                            final_answers.append(answer["answer"])
-
-                    if not final_answers:
-                        st.info("No relevant answer found. Trying concept explanation...")
-                        # Use QA pipeline with the whole PDF text as context for explanation
-                        try:
-                            explanation = qa_pipeline(question=f"Explain the concept: {question}", context=pdf_text)
-                            if explanation.get("score", 0) > 0.0:
-                                st.markdown(f"**Explanation:** {explanation['answer']}")
-                        except:
-                            st.info("Could not generate explanation.")
-                    else:
-                        combined_answer = " ".join(list(dict.fromkeys(final_answers)))  # remove duplicates
-                        st.markdown(f"**Answer:** {combined_answer}")
-                        st.download_button(
-                            label="Download Answer",
-                            data=combined_answer,
-                            file_name="memo_answer.txt",
-                            mime="text/plain"
-                        )
+# ==================== FOOTER ====================
+st.markdown("---")
+st.markdown("<div class='footer'>👑 Built by Code Tech Titans | StudyMate 2025</div>", unsafe_allow_html=True)
